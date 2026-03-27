@@ -1,0 +1,64 @@
+services:
+  # ── PostgreSQL ──────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: poller
+      POSTGRES_PASSWORD: poller
+      POSTGRES_DB: codesystem_poller
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poller -d codesystem_poller"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # ── Run SQL migrations on startup ──────────────────────
+  migrate:
+    image: postgres:16-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: >
+      sh -c '
+        for f in /migrations/*.sql; do
+          echo "Applying $$f ..."
+          PGPASSWORD=poller psql -h db -U poller -d codesystem_poller -f "$$f"
+        done
+        echo "Migrations done."
+      '
+
+  # ── RabbitMQ ────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"    # management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Poller service ──────────────────────────────────────
+  poller:
+    build: .
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://poller:poller@db:5432/codesystem_poller
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    restart: unless-stopped
+
+volumes:
+  pgdata:
