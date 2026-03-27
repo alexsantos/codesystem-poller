@@ -108,6 +108,7 @@ codesystem-poller/
 │   ├── poller.py             # HTTP fetch + SHA-256 hash comparison
 │   ├── differ.py             # Concept flattening, diffing, state persistence
 │   ├── fhir_bundle.py        # FHIR R4 message Bundle builder
+│   ├── fhir_forwarder.py     # RabbitMQ consumer → FHIR $process-message POST
 │   ├── outbox_relay.py       # Outbox → RabbitMQ relay
 │   ├── scheduler.py          # Poll cycle orchestration
 │   └── main.py               # Entry point (scheduler + relay)
@@ -338,15 +339,78 @@ channel.basic_consume(queue="my-consumer-queue", on_message_callback=on_message)
 channel.start_consuming()
 ```
 
-### Processing as FHIR `$process-message`
+### Forwarding to a FHIR `$process-message` Endpoint
 
-If your downstream system exposes a FHIR `$process-message` endpoint, you can POST the Bundle directly:
+If a downstream system exposes a FHIR `$process-message` endpoint (e.g., an integration engine, another EHR, or a FHIR façade), the project includes a **FHIR Forwarder** service that acts as a RabbitMQ consumer and POSTs each Bundle to that endpoint.
+
+The flow is:
+
+```
+Poller → outbox → RabbitMQ → FHIR Forwarder → POST to downstream $process-message
+```
+
+The forwarder is a separate consumer with its own queue bound to the same exchange. This means other consumers (your own internal services, analytics pipelines, etc.) can also bind to the exchange independently — the forwarder doesn't interfere with them.
+
+**Starting the forwarder:**
+
+The forwarder is defined as a Docker Compose profile so it doesn't start by default:
 
 ```bash
-curl -X POST https://downstream/fhir/$process-message \
-  -H "Content-Type: application/fhir+json" \
-  -d @bundle.json
+# Add these to your .env (or export them)
+FHIR_TARGET_URL=https://downstream.example/fhir/$process-message
+FHIR_AUTH_TOKEN=your-bearer-token  # optional, omit if not needed
+
+# Start everything including the forwarder
+docker compose --profile forwarder up -d
 ```
+
+**Running the forwarder standalone** (if you use external RabbitMQ):
+
+```bash
+docker run -d \
+  --name fhir-forwarder \
+  --restart unless-stopped \
+  -e RABBITMQ_URL=amqp://user:pass@your-rabbitmq:5672/ \
+  -e RABBITMQ_EXCHANGE=codesystem.changes \
+  -e RABBITMQ_QUEUE=fhir-forwarder \
+  -e RABBITMQ_ROUTING_KEY="codesystem.#" \
+  -e FHIR_TARGET_URL=https://downstream.example/fhir/$process-message \
+  -e FHIR_AUTH_TOKEN=your-bearer-token \
+  codesystem-poller python -m src.fhir_forwarder
+```
+
+**How it handles failures:**
+
+The forwarder retries with exponential backoff on transient errors (5xx, network failures). On permanent errors (4xx), it logs the rejection and ACKs the message to avoid infinite requeue. If all retries are exhausted, the message is NACKed with requeue. In production, you should configure a **dead-letter exchange (DLX)** on the `fhir-forwarder` queue so that repeatedly failing messages move to a dead-letter queue instead of looping forever.
+
+| Forwarder variable | Default | Description |
+|---|---|---|
+| `FHIR_TARGET_URL` | (required) | Full URL to the downstream `$process-message` endpoint |
+| `FHIR_AUTH_TOKEN` | (empty) | Bearer token for authentication (omit if not needed) |
+| `RABBITMQ_QUEUE` | `fhir-forwarder` | Durable queue name for this consumer |
+| `RABBITMQ_ROUTING_KEY` | `codesystem.#` | Routing key pattern (`#` = all CodeSystems) |
+| `MAX_RETRIES` | `3` | Retry attempts per message on transient failure |
+| `RETRY_DELAY` | `5` | Initial retry delay in seconds (doubles each retry) |
+
+**Testing the flow manually:**
+
+```bash
+# 1. Start the stack with the forwarder
+docker compose --profile forwarder up -d
+
+# 2. Watch the forwarder logs
+docker compose logs -f fhir-forwarder
+
+# 3. Force a poll cycle (if the CodeSystem has changed since baseline)
+docker compose exec poller python -c \
+  "from src.scheduler import run_poll_cycle; run_poll_cycle()"
+
+# 4. You should see the forwarder receive the Bundle and POST it
+```
+
+**Writing your own consumer instead:**
+
+If your downstream system doesn't speak FHIR, you don't need the forwarder at all. Write any RabbitMQ consumer that binds to the exchange, parses the Bundle JSON, and does whatever you need — update a database, send a Slack notification, trigger a pipeline. The example in the section above shows the basic pattern.
 
 ## Operations
 

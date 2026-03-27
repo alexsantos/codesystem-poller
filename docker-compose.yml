@@ -60,5 +60,30 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
     restart: unless-stopped
 
+  # ── FHIR Forwarder (optional) ──────────────────────────
+  # Consumes Bundles from RabbitMQ and POSTs them to a
+  # downstream FHIR $process-message endpoint.
+  # Disabled by default — enable with:
+  #   docker compose --profile forwarder up -d
+  fhir-forwarder:
+    build: .
+    command: ["python", "-m", "src.fhir_forwarder"]
+    profiles:
+      - forwarder
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: codesystem.changes
+      RABBITMQ_QUEUE: fhir-forwarder
+      RABBITMQ_ROUTING_KEY: "codesystem.#"
+      FHIR_TARGET_URL: ${FHIR_TARGET_URL:-http://localhost:8080/fhir/$process-message}
+      FHIR_AUTH_TOKEN: ${FHIR_AUTH_TOKEN:-}
+      MAX_RETRIES: "3"
+      RETRY_DELAY: "5"
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
 volumes:
   pgdata:

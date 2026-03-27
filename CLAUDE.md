@@ -98,6 +98,7 @@ carry just the delta, are self-describing, and each one maps to a single outbox 
 ```
 codesystem-poller/
 ├── CLAUDE.md               ← this file
+├── README.md
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
@@ -111,6 +112,7 @@ codesystem-poller/
 │   ├── poller.py           ← HTTP fetch + raw hash check
 │   ├── differ.py           ← concept flattening + diffing logic
 │   ├── fhir_bundle.py      ← FHIR R4 message Bundle builder
+│   ├── fhir_forwarder.py   ← RabbitMQ consumer → POST to FHIR $process-message
 │   ├── outbox_relay.py     ← reads outbox, builds Bundle, publishes to RabbitMQ
 │   ├── scheduler.py        ← APScheduler cron trigger entry point
 │   └── main.py             ← boots scheduler + outbox relay
