@@ -39,9 +39,8 @@ def transaction() -> Generator[psycopg.Cursor, None, None]:
 def check_health() -> bool:
     """Quick connectivity check."""
     try:
-        conn = get_connection()
-        conn.execute("SELECT 1")
-        conn.close()
+        with get_connection() as conn:
+            conn.execute("SELECT 1")
         return True
     except Exception as exc:
         logger.error("Database health check failed: %s", exc)

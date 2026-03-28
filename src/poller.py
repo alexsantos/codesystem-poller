@@ -16,7 +16,7 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 
-def fetch_codesystem() -> tuple[bytes, dict] | None:
+def fetch_codesystem(url: str) -> tuple[bytes, dict] | None:
     """
     GET the FHIR CodeSystem endpoint.
     Returns (raw_bytes, parsed_json) or None on failure.
@@ -24,7 +24,7 @@ def fetch_codesystem() -> tuple[bytes, dict] | None:
     try:
         with httpx.Client(timeout=settings.http_timeout) as client:
             resp = client.get(
-                settings.fhir_codesystem_url,
+                url,
                 headers={"Accept": "application/fhir+json"},
             )
             resp.raise_for_status()

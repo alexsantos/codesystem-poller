@@ -62,6 +62,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL}
       RABBITMQ_URL: ${RABBITMQ_URL}
+    volumes:
+      - ./codesystems.yml:/app/codesystems.yml:ro
     restart: unless-stopped
 
   # ── FHIR Forwarder (optional) ──────────────────────────

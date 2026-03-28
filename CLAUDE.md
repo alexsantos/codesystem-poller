@@ -97,35 +97,36 @@ carry just the delta, are self-describing, and each one maps to a single outbox 
 
 ```
 codesystem-poller/
-├── CLAUDE.md               ← this file
+├── CLAUDE.md                  ← this file
 ├── README.md
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
 ├── .env.example
+├── codesystems.yml            ← list of CodeSystems to monitor (gitignored)
+├── codesystems.yml.example    ← template committed to the repo
 ├── migrations/
-│   └── 001_init.sql        ← PG schema: sync_state, concept_state, change_outbox
+│   └── 001_init.sql           ← PG schema: sync_state, concept_state, change_outbox
 ├── src/
 │   ├── __init__.py
-│   ├── config.py           ← pydantic-settings, all env vars
-│   ├── db.py               ← psycopg3 connection pool, transaction helper
-│   ├── poller.py           ← HTTP fetch + raw hash check
-│   ├── differ.py           ← concept flattening + diffing logic
-│   ├── fhir_bundle.py      ← FHIR R4 message Bundle builder
-│   ├── fhir_forwarder.py   ← RabbitMQ consumer → POST to FHIR $process-message
-│   ├── outbox_relay.py     ← reads outbox, builds Bundle, publishes to RabbitMQ
-│   ├── scheduler.py        ← APScheduler cron trigger entry point
-│   └── main.py             ← boots scheduler + outbox relay
+│   ├── config.py              ← pydantic-settings, env vars, CodeSystemEntry, load_codesystems()
+│   ├── db.py                  ← psycopg3 connection pool, transaction helper
+│   ├── poller.py              ← HTTP fetch + raw hash check (accepts url param)
+│   ├── differ.py              ← concept flattening + diffing logic
+│   ├── fhir_bundle.py         ← FHIR R4 message Bundle builder
+│   ├── fhir_forwarder.py      ← RabbitMQ consumer → POST to FHIR $process-message
+│   ├── outbox_relay.py        ← reads outbox, builds Bundle, publishes to RabbitMQ
+│   ├── scheduler.py           ← iterates over CodeSystems, runs poll cycle per entry
+│   └── main.py                ← boots scheduler + outbox relay
 └── tests/
-    └── test_differ.py      ← unit tests for the differ
+    └── test_differ.py         ← unit tests for the differ
 ```
 
 ## Configuration (environment variables)
 
 | Variable | Default | Description |
 |---|---|---|
-| `FHIR_CODESYSTEM_URL` | (required) | Full URL to the CodeSystem endpoint |
-| `CODESYSTEM_CANONICAL_URL` | (required) | Canonical URL of the CodeSystem (used as system_url key) |
+| `CODESYSTEMS_CONFIG` | `/app/codesystems.yml` | Path inside the container to the CodeSystems YAML config file |
 | `POLL_CRON` | `0 */4 * * *` | Cron expression for poll frequency |
 | `CANONICAL_HASH` | `false` | Use canonical JSON hashing instead of raw body hash |
 | `DATABASE_URL` | `postgresql://poller:poller@db:5432/codesystem_poller` | PostgreSQL DSN |
@@ -134,6 +135,30 @@ codesystem-poller/
 | `OUTBOX_POLL_INTERVAL` | `5` | Seconds between outbox relay cycles |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `HTTP_TIMEOUT` | `30` | Seconds for the FHIR API request timeout |
+
+## CodeSystems Config File
+
+The list of CodeSystems to monitor is defined in `codesystems.yml` (mounted into
+the container at `/app/codesystems.yml`). This file is gitignored — copy
+`codesystems.yml.example` to get started.
+
+```yaml
+codesystems:
+  - url: https://your-fhir-server.example/fhir/CodeSystem/FirstCodeSystem
+    canonical_url: https://your-org.example/fhir/CodeSystem/FirstCodeSystem
+
+  - url: https://your-fhir-server.example/fhir/CodeSystem/SecondCodeSystem
+    # canonical_url omitted — defaults to url
+```
+
+- `url`: the HTTP endpoint to poll
+- `canonical_url`: the CodeSystem's canonical identifier, used as the primary key in
+  all state tables and as the `system` field in FHIR Bundles. Defaults to `url` if
+  omitted.
+
+Each CodeSystem gets its own rows in `codesystem_sync_state` and
+`codesystem_concept_state`. The scheduler iterates over all entries sequentially
+on each cron tick.
 
 ## Database Schema
 
@@ -176,6 +201,8 @@ Consumers bind queues to this exchange with the routing key pattern they care ab
 ## Running
 
 ```bash
+cp codesystems.yml.example codesystems.yml   # edit with your CodeSystem URLs
+cp .env.example .env                          # edit credentials
 docker compose up -d
 ```
 
@@ -189,7 +216,7 @@ service. Logs go to stdout (docker compose logs -f poller).
 docker compose run --rm poller python -m pytest tests/ -v
 
 # Run a manual poll cycle (bypasses scheduler)
-docker compose run --rm poller python -c "from src.poller import run_poll_cycle; import asyncio; asyncio.run(run_poll_cycle())"
+docker compose run --rm poller python -c "from src.scheduler import run_poll_cycle; run_poll_cycle()"
 
 # Check outbox state
 docker compose exec db psql -U poller -d codesystem_poller -c "SELECT id, change_type, code, published, created_at FROM poller.change_outbox ORDER BY id DESC LIMIT 20;"

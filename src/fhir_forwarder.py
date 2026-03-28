@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import time
+from urllib.parse import urlparse
 
 import httpx
 import pika
@@ -47,6 +48,17 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("fhir-forwarder")
+
+
+def _redact_url(url: str) -> str:
+    """Strip credentials from an AMQP/HTTP URL before logging."""
+    parsed = urlparse(url)
+    if parsed.username or parsed.password:
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        redacted = parsed._replace(netloc=f"{host}{port}")
+        return redacted.geturl()
+    return url
 
 
 # ── FHIR POST with retries ──────────────────────────────────────────────
@@ -161,13 +173,14 @@ def run_consumer() -> None:
         sys.exit(1)
 
     logger.info("FHIR Forwarder starting")
-    logger.info("  RabbitMQ:     %s", RABBITMQ_URL)
+    logger.info("  RabbitMQ:     %s", _redact_url(RABBITMQ_URL))
     logger.info("  Exchange:     %s", RABBITMQ_EXCHANGE)
     logger.info("  Queue:        %s", RABBITMQ_QUEUE)
     logger.info("  Routing key:  %s", RABBITMQ_ROUTING_KEY)
     logger.info("  Target:       %s", FHIR_TARGET_URL)
 
     while True:
+        connection = None
         try:
             params = pika.URLParameters(RABBITMQ_URL)
             connection = pika.BlockingConnection(params)
@@ -208,6 +221,12 @@ def run_consumer() -> None:
         except KeyboardInterrupt:
             logger.info("Shutting down")
             break
+        finally:
+            if connection is not None and not connection.is_closed:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

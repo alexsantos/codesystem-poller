@@ -24,6 +24,8 @@ htmlcov/
 .env
 .env.*
 !.env.example
+codesystems.yml
+!codesystems.yml.example
 *.pem
 *.key
 *.crt

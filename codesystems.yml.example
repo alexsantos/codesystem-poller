@@ -1,0 +1,14 @@
+# List of FHIR CodeSystems to monitor.
+#
+# url:           The endpoint URL to poll (HTTP GET).
+# canonical_url: The CodeSystem's canonical identifier, used as the database key.
+#                Optional — defaults to url if omitted.
+#
+# Copy this file to codesystems.yml and fill in your values.
+
+codesystems:
+  - url: https://your-fhir-server.example/fhir/CodeSystem/FirstCodeSystem
+    canonical_url: https://your-org.example/fhir/CodeSystem/FirstCodeSystem
+
+  - url: https://your-fhir-server.example/fhir/CodeSystem/SecondCodeSystem
+    # canonical_url omitted — defaults to url

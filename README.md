@@ -93,28 +93,29 @@ The **transactional outbox pattern** ensures that if the service crashes between
 
 ```
 codesystem-poller/
-├── CLAUDE.md                 # Architecture context for Claude Code
-├── README.md                 # This file
+├── CLAUDE.md                  # Architecture context for Claude Code
+├── README.md                  # This file
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml
 ├── .env.example
+├── codesystems.yml.example    # Template — copy to codesystems.yml and edit
 ├── migrations/
-│   └── 001_init.sql          # PostgreSQL schema
+│   └── 001_init.sql           # PostgreSQL schema
 ├── src/
 │   ├── __init__.py
-│   ├── config.py             # Pydantic settings (all env vars)
-│   ├── db.py                 # psycopg3 connection + transaction helper
-│   ├── poller.py             # HTTP fetch + SHA-256 hash comparison
-│   ├── differ.py             # Concept flattening, diffing, state persistence
-│   ├── fhir_bundle.py        # FHIR R4 message Bundle builder
-│   ├── fhir_forwarder.py     # RabbitMQ consumer → FHIR $process-message POST
-│   ├── outbox_relay.py       # Outbox → RabbitMQ relay
-│   ├── scheduler.py          # Poll cycle orchestration
-│   └── main.py               # Entry point (scheduler + relay)
+│   ├── config.py              # Pydantic settings + CodeSystemEntry + load_codesystems()
+│   ├── db.py                  # psycopg3 connection + transaction helper
+│   ├── poller.py              # HTTP fetch + SHA-256 hash comparison
+│   ├── differ.py              # Concept flattening, diffing, state persistence
+│   ├── fhir_bundle.py         # FHIR R4 message Bundle builder
+│   ├── fhir_forwarder.py      # RabbitMQ consumer → FHIR $process-message POST
+│   ├── outbox_relay.py        # Outbox → RabbitMQ relay
+│   ├── scheduler.py           # Poll cycle orchestration (iterates all CodeSystems)
+│   └── main.py                # Entry point (scheduler + relay)
 └── tests/
     ├── __init__.py
-    └── test_differ.py         # Unit tests for flatten + diff logic
+    └── test_differ.py          # Unit tests for flatten + diff logic
 ```
 
 ## Prerequisites
@@ -139,12 +140,25 @@ cd codesystem-poller
 cp .env.example .env
 ```
 
-3. **Edit `.env`** — at minimum, set these two values:
+Edit `.env` to set your PostgreSQL and RabbitMQ credentials.
 
-```dotenv
-FHIR_CODESYSTEM_URL=https://your-fhir-server.example/fhir/CodeSystem/your-codesystem
-CODESYSTEM_CANONICAL_URL=https://your-org.example/fhir/CodeSystem/lab-analyses
+3. **Create your CodeSystems config**
+
+```bash
+cp codesystems.yml.example codesystems.yml
 ```
+
+Edit `codesystems.yml` with the FHIR CodeSystem endpoints you want to monitor:
+
+```yaml
+codesystems:
+  - url: https://your-fhir-server.example/fhir/CodeSystem/FirstCodeSystem
+    canonical_url: https://your-org.example/fhir/CodeSystem/FirstCodeSystem
+
+  - url: https://your-fhir-server.example/fhir/CodeSystem/SecondCodeSystem
+```
+
+Add as many entries as needed. `canonical_url` is optional and defaults to `url` if omitted.
 
 4. **Start everything**
 
@@ -169,20 +183,45 @@ On the first run, the poller stores the full snapshot as the baseline state. No 
 
 ## Configuration
 
-All configuration is done through environment variables (or the `.env` file).
+### CodeSystems (`codesystems.yml`)
+
+The list of FHIR CodeSystems to monitor is defined in `codesystems.yml`, mounted
+into the container at `/app/codesystems.yml`. This file is **gitignored** — use
+`codesystems.yml.example` as a template.
+
+```yaml
+codesystems:
+  - url: https://your-fhir-server.example/fhir/CodeSystem/A
+    canonical_url: https://your-org.example/fhir/CodeSystem/A   # optional
+
+  - url: https://your-fhir-server.example/fhir/CodeSystem/B
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `url` | Yes | HTTP endpoint to poll |
+| `canonical_url` | No | Primary key used in state tables and FHIR Bundles. Defaults to `url` if omitted |
+
+To add a new CodeSystem, append an entry and restart the container.
+
+### Environment Variables (`.env`)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FHIR_CODESYSTEM_URL` | Yes | — | Full URL to the FHIR CodeSystem endpoint to poll |
-| `CODESYSTEM_CANONICAL_URL` | Yes | — | Canonical URL of the CodeSystem (used as the primary key in state tables and in FHIR Bundle `system` fields) |
-| `POLL_CRON` | No | `0 */4 * * *` | Cron expression controlling poll frequency. Default: every 4 hours |
-| `CANONICAL_HASH` | No | `false` | Set to `true` if the FHIR server returns non-deterministic JSON (shuffled field order or varying whitespace). Parses and canonicalises the JSON before hashing to prevent phantom diffs |
-| `DATABASE_URL` | No | `postgresql://poller:poller@db:5432/codesystem_poller` | PostgreSQL connection string |
-| `RABBITMQ_URL` | No | `amqp://guest:guest@rabbitmq:5672/` | RabbitMQ AMQP connection string |
+| `CODESYSTEMS_CONFIG` | No | `/app/codesystems.yml` | Path inside the container to the CodeSystems YAML file |
+| `POSTGRES_USER` | Yes | — | PostgreSQL username |
+| `POSTGRES_PASSWORD` | Yes | — | PostgreSQL password |
+| `POSTGRES_DB` | Yes | — | PostgreSQL database name |
+| `DATABASE_URL` | Yes | — | PostgreSQL connection string |
+| `RABBITMQ_USER` | Yes | — | RabbitMQ username |
+| `RABBITMQ_PASSWORD` | Yes | — | RabbitMQ password |
+| `RABBITMQ_URL` | Yes | — | RabbitMQ AMQP connection string |
+| `POLL_CRON` | No | `0 */4 * * *` | Cron expression controlling poll frequency |
+| `CANONICAL_HASH` | No | `false` | Set to `true` if the FHIR server returns non-deterministic JSON |
 | `RABBITMQ_EXCHANGE` | No | `codesystem.changes` | Name of the RabbitMQ topic exchange |
 | `OUTBOX_POLL_INTERVAL` | No | `5` | Seconds between outbox relay cycles |
 | `LOG_LEVEL` | No | `INFO` | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `HTTP_TIMEOUT` | No | `30` | Timeout in seconds for the FHIR API HTTP request |
+| `HTTP_TIMEOUT` | No | `30` | Timeout in seconds for FHIR API HTTP requests |
 
 ### Adjusting Poll Frequency
 
@@ -236,8 +275,7 @@ docker build -t codesystem-poller .
 docker run -d \
   --name codesystem-poller \
   --restart unless-stopped \
-  -e FHIR_CODESYSTEM_URL=https://your-fhir-server/fhir/CodeSystem/your-cs \
-  -e CODESYSTEM_CANONICAL_URL=https://your-org/fhir/CodeSystem/lab-analyses \
+  -v ./codesystems.yml:/app/codesystems.yml:ro \
   -e DATABASE_URL=postgresql://user:pass@your-pg-host:5432/your_db \
   -e RABBITMQ_URL=amqp://user:pass@your-rabbitmq-host:5672/ \
   codesystem-poller
@@ -402,7 +440,7 @@ docker compose --profile forwarder up -d
 docker compose logs -f fhir-forwarder
 
 # 3. Force a poll cycle (if the CodeSystem has changed since baseline)
-docker compose exec poller python -c \
+docker compose run --rm poller python -c \
   "from src.scheduler import run_poll_cycle; run_poll_cycle()"
 
 # 4. You should see the forwarder receive the Bundle and POST it
@@ -448,8 +486,8 @@ docker compose exec db psql -U poller -d codesystem_poller -c \
   "SELECT system_url, COUNT(*) AS concepts
    FROM poller.codesystem_concept_state GROUP BY system_url;"
 
-# Force a manual poll cycle (bypasses the cron schedule)
-docker compose exec poller python -c \
+# Force a manual poll cycle for all configured CodeSystems
+docker compose run --rm poller python -c \
   "from src.scheduler import run_poll_cycle; run_poll_cycle()"
 
 # Reset all state (next poll stores a fresh baseline, no events emitted)

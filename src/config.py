@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import yaml
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # FHIR source
-    fhir_codesystem_url: str
-    codesystem_canonical_url: str
+    # CodeSystems config file
+    codesystems_config: str = "/app/codesystems.yml"
 
     # Schedule
     poll_cron: str = "0 */4 * * *"
@@ -31,6 +33,29 @@ class Settings(BaseSettings):
     http_timeout: int = 30
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+
+@dataclass
+class CodeSystemEntry:
+    url: str
+    canonical_url: str
+
+
+def load_codesystems() -> list[CodeSystemEntry]:
+    """Load the list of CodeSystems to monitor from the YAML config file."""
+    with open(settings.codesystems_config) as f:
+        data = yaml.safe_load(f)
+
+    entries = []
+    for item in data.get("codesystems", []):
+        url = item["url"]
+        canonical_url = item.get("canonical_url", url)
+        entries.append(CodeSystemEntry(url=url, canonical_url=canonical_url))
+
+    if not entries:
+        raise ValueError(f"No codesystems defined in {settings.codesystems_config}")
+
+    return entries
 
 
 settings = Settings()  # type: ignore[call-arg]
