@@ -100,6 +100,7 @@ codesystem-poller/
 ├── pyproject.toml
 ├── .env.example
 ├── codesystems.yml.example    # Template — copy to codesystems.yml and edit
+├── codesystem-poller.service  # systemd unit file for Linux VM deployment
 ├── migrations/
 │   └── 001_init.sql           # PostgreSQL schema
 ├── src/
@@ -249,13 +250,78 @@ POLL_CRON=0 8 * * 1-5      # Once a day at 08:00, weekdays only
 
 ## Deployment
 
-### Docker Compose (recommended for single-node)
+### Docker Compose on a Linux VM (recommended)
 
-The provided `docker-compose.yml` is production-ready for single-node deployments. It includes health checks, restart policies, and proper service dependency ordering.
+The provided `docker-compose.yml` is production-ready for Linux VM deployments. It includes health checks, restart policies, and port binding restricted to `127.0.0.1` so PostgreSQL and RabbitMQ are not reachable from outside the VM.
 
 ```bash
 docker compose up -d
 ```
+
+---
+
+### Auto-start with systemd
+
+A `codesystem-poller.service` unit file is included in the repository. It integrates Docker Compose with systemd so the stack starts automatically on VM boot and is restarted if it crashes.
+
+**1. Deploy the repository to the VM**
+
+```bash
+# On the VM — clone or copy the project
+git clone <your-repo-url> /opt/codesystem-poller
+cd /opt/codesystem-poller
+
+# Set up config files
+cp .env.example .env          # edit with real credentials
+cp codesystems.yml.example codesystems.yml   # edit with your CodeSystem URLs
+```
+
+**2. Build the image**
+
+```bash
+docker compose build
+```
+
+**3. Install the systemd unit**
+
+```bash
+# Copy the unit file to the systemd directory
+sudo cp codesystem-poller.service /etc/systemd/system/
+
+# Edit WorkingDirectory if you deployed to a different path than /opt/codesystem-poller
+sudo systemctl daemon-reload
+```
+
+**4. Enable and start**
+
+```bash
+sudo systemctl enable codesystem-poller   # start on boot
+sudo systemctl start codesystem-poller    # start now
+```
+
+**5. Check status and logs**
+
+```bash
+sudo systemctl status codesystem-poller
+
+# Follow live logs (all containers)
+sudo journalctl -u codesystem-poller -f
+
+# Or via Docker Compose directly
+docker compose -f /opt/codesystem-poller/docker-compose.yml logs -f
+```
+
+**Common systemd commands**
+
+```bash
+sudo systemctl stop codesystem-poller      # graceful stop
+sudo systemctl restart codesystem-poller   # restart all containers
+sudo systemctl disable codesystem-poller   # remove from boot
+```
+
+**Note:** The unit file is configured for Docker. If you use Podman, replace `/usr/bin/docker` with `/usr/bin/podman` in the `ExecStart`/`ExecStop`/`ExecStartPre` lines, and change `Requires=docker.service` to `Requires=podman.service` (or remove it if using rootless Podman, which needs no daemon).
+
+---
 
 ### Using External PostgreSQL and RabbitMQ
 

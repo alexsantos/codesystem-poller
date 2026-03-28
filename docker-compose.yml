@@ -7,9 +7,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"    # localhost only — not exposed to the network
     volumes:
       - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U poller -d codesystem_poller"]
       interval: 3s
@@ -41,8 +42,9 @@ services:
     environment:
       RABBITMQ_ERLANG_COOKIE: "codesystem-poller-cookie"
     ports:
-      - "5672:5672"
-      - "15672:15672"    # management UI
+      - "127.0.0.1:5672:5672"        # localhost only
+      - "127.0.0.1:15672:15672"      # management UI — localhost only
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 5s

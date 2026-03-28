@@ -1,0 +1,33 @@
+[Unit]
+Description=CodeSystem Change Poller
+Documentation=https://github.com/your-org/codesystem-poller
+# Wait for network and Docker/Podman daemon before starting
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# Set the working directory to where the repo is deployed on the VM
+WorkingDirectory=/opt/codesystem-poller
+
+# Pull latest images on start (remove if you prefer manual image management)
+ExecStartPre=/usr/bin/docker compose pull --quiet
+
+ExecStart=/usr/bin/docker compose up --remove-orphans
+ExecStop=/usr/bin/docker compose down --timeout 30
+
+# Restart the service if it exits unexpectedly (but not on clean stop)
+Restart=on-failure
+RestartSec=10
+
+# Give containers time to shut down gracefully before systemd kills the process
+TimeoutStopSec=60
+
+# Redirect stdout/stderr to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=codesystem-poller
+
+[Install]
+WantedBy=multi-user.target
