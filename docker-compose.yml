@@ -1,11 +1,11 @@
 services:
   # ── PostgreSQL ──────────────────────────────────────────
   db:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
-      POSTGRES_USER: poller
-      POSTGRES_PASSWORD: poller
-      POSTGRES_DB: codesystem_poller
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -18,7 +18,7 @@ services:
 
   # ── Run SQL migrations on startup ──────────────────────
   migrate:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     depends_on:
       db:
         condition: service_healthy
@@ -28,14 +28,18 @@ services:
       sh -c '
         for f in /migrations/*.sql; do
           echo "Applying $$f ..."
-          PGPASSWORD=poller psql -h db -U poller -d codesystem_poller -f "$$f"
+          PGPASSWORD=${POSTGRES_PASSWORD} psql -h db -U ${POSTGRES_USER} -d ${POSTGRES_DB} -f "$$f"
         done
         echo "Migrations done."
       '
 
   # ── RabbitMQ ────────────────────────────────────────────
   rabbitmq:
-    image: rabbitmq:3-management-alpine
+    image: rabbitmq:4-management-alpine
+    hostname: rabbitmq
+    user: rabbitmq
+    environment:
+      RABBITMQ_ERLANG_COOKIE: "codesystem-poller-cookie"
     ports:
       - "5672:5672"
       - "15672:15672"    # management UI
@@ -56,8 +60,8 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://poller:poller@db:5432/codesystem_poller
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      DATABASE_URL: ${DATABASE_URL}
+      RABBITMQ_URL: ${RABBITMQ_URL}
     restart: unless-stopped
 
   # ── FHIR Forwarder (optional) ──────────────────────────
@@ -74,11 +78,11 @@ services:
       rabbitmq:
         condition: service_healthy
     environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_URL: ${RABBITMQ_URL}
       RABBITMQ_EXCHANGE: codesystem.changes
       RABBITMQ_QUEUE: fhir-forwarder
       RABBITMQ_ROUTING_KEY: "codesystem.#"
-      FHIR_TARGET_URL: ${FHIR_TARGET_URL:-http://localhost:8080/fhir/$process-message}
+      FHIR_TARGET_URL: ${FHIR_TARGET_URL:-http://localhost:8080/fhir/$$process-message}
       FHIR_AUTH_TOKEN: ${FHIR_AUTH_TOKEN:-}
       MAX_RETRIES: "3"
       RETRY_DELAY: "5"
