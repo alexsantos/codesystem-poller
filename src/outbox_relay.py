@@ -180,8 +180,8 @@ def relay_once() -> int:
             finally:
                 try:
                     rmq_conn.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Error closing RabbitMQ connection: %s", exc)
     except Exception as exc:
         logger.error("Relay cycle failed: %s", exc, exc_info=True)
         conn.rollback()

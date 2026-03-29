@@ -229,8 +229,8 @@ def run_consumer() -> None:
             if connection is not None and not connection.is_closed:
                 try:
                     connection.close()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Error closing RabbitMQ connection: %s", exc)
 
 
 if __name__ == "__main__":
