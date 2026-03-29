@@ -88,6 +88,8 @@ services:
       RABBITMQ_ROUTING_KEY: "codesystem.#"
       FHIR_TARGET_URL: ${FHIR_TARGET_URL:-http://localhost:8080/fhir/$$process-message}
       FHIR_AUTH_TOKEN: ${FHIR_AUTH_TOKEN:-}
+      FHIR_AUTH_USER: ${FHIR_AUTH_USER:-}
+      FHIR_AUTH_PASSWORD: ${FHIR_AUTH_PASSWORD:-}
       MAX_RETRIES: "3"
       RETRY_DELAY: "5"
       LOG_LEVEL: INFO

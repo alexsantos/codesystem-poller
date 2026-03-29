@@ -38,6 +38,8 @@ RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "fhir-forwarder")
 RABBITMQ_ROUTING_KEY = os.getenv("RABBITMQ_ROUTING_KEY", "codesystem.#")
 FHIR_TARGET_URL = os.getenv("FHIR_TARGET_URL", "")
 FHIR_AUTH_TOKEN = os.getenv("FHIR_AUTH_TOKEN", "")
+FHIR_AUTH_USER = os.getenv("FHIR_AUTH_USER", "")
+FHIR_AUTH_PASSWORD = os.getenv("FHIR_AUTH_PASSWORD", "")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_DELAY = int(os.getenv("RETRY_DELAY", "5"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -76,10 +78,12 @@ def post_bundle(bundle_json: bytes) -> bool:
     if FHIR_AUTH_TOKEN:
         headers["Authorization"] = f"Bearer {FHIR_AUTH_TOKEN}"
 
+    auth = (FHIR_AUTH_USER, FHIR_AUTH_PASSWORD) if FHIR_AUTH_USER and FHIR_AUTH_PASSWORD else None
+
     delay = RETRY_DELAY
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            with httpx.Client(timeout=30) as client:
+            with httpx.Client(timeout=30, auth=auth) as client:
                 resp = client.post(
                     FHIR_TARGET_URL,
                     content=bundle_json,
