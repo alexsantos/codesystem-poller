@@ -16,6 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from src.config import load_codesystems, settings
 from src.db import check_health
+from src.outbox_relay import close_target, get_target, relay_once
 from src.scheduler import run_poll_cycle
 
 logging.basicConfig(
@@ -41,15 +42,20 @@ def _wait_for_db(max_retries: int = 30, delay: float = 2.0) -> None:
 
 
 def _relay_loop_with_shutdown() -> None:
-    """Wrapper around run_relay_loop that exits when _shutdown is set."""
-    logger.info("Outbox relay started (interval=%ds)", settings.outbox_poll_interval)
-    while not _shutdown.is_set():
-        try:
-            from src.outbox_relay import relay_once
-            relay_once()
-        except Exception as exc:
-            logger.error("Relay loop error: %s", exc, exc_info=True)
-        _shutdown.wait(timeout=settings.outbox_poll_interval)
+    """Relay loop that exits (between deliveries) when _shutdown is set."""
+    logger.info(
+        "Outbox relay started (target=%s, interval=%ds)",
+        settings.relay_target, settings.outbox_poll_interval,
+    )
+    try:
+        while not _shutdown.is_set():
+            try:
+                relay_once(should_stop=_shutdown.is_set)
+            except Exception as exc:
+                logger.error("Relay loop error: %s", exc, exc_info=True)
+            _shutdown.wait(timeout=settings.outbox_poll_interval)
+    finally:
+        close_target()
     logger.info("Outbox relay stopped")
 
 
@@ -62,7 +68,16 @@ def main() -> None:
     logger.info("  Poll cron:      %s", settings.poll_cron)
     logger.info("  Canonical hash: %s", settings.canonical_hash)
     if settings.relay_enabled:
-        logger.info("  Outbox relay:   enabled (interval=%ds)", settings.outbox_poll_interval)
+        target = settings.fhir_target_url if settings.relay_target == "fhir" else settings.rabbitmq_exchange
+        logger.info(
+            "  Outbox relay:   enabled → %s (%s), interval=%ds, on reject: %s",
+            settings.relay_target, target, settings.outbox_poll_interval, settings.relay_on_reject,
+        )
+        try:
+            get_target()  # fail fast on misconfiguration (e.g. missing FHIR_TARGET_URL)
+        except ValueError as exc:
+            logger.error("Invalid relay configuration: %s", exc)
+            sys.exit(1)
     else:
         logger.info("  Outbox relay:   DISABLED (database-only mode; outbox rows are kept, not published)")
 

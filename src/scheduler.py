@@ -13,6 +13,8 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+from psycopg import sql
+
 from src.config import CodeSystemEntry, load_codesystems, settings
 from src.db import transaction
 from src.differ import (
@@ -133,16 +135,18 @@ def _start_run(discovered: int) -> int | None:
 def _record_result(run_id: int | None, result: PollResult) -> None:
     if run_id is None:
         return
-    column = result.status  # unchanged | changed | skipped | failed (fixed set, see PollStatus)
+    column = sql.Identifier(result.status)  # unchanged | changed | skipped | failed
     try:
         with transaction() as cur:
             cur.execute(
-                f"""
-                UPDATE poller.sync_run
-                SET {column} = {column} + 1,
-                    details = details || %s::jsonb
-                WHERE id = %s
-                """,  # nosec B608 - column comes from the PollStatus literal, not user input
+                sql.SQL(
+                    """
+                    UPDATE poller.sync_run
+                    SET {col} = {col} + 1,
+                        details = details || %s::jsonb
+                    WHERE id = %s
+                    """
+                ).format(col=column),
                 (json.dumps([asdict(result)]), run_id),
             )
     except Exception as exc:
