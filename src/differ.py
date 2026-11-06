@@ -226,7 +226,9 @@ def touch_last_seen(cur, system_url: str, endpoint_url: str | None = None) -> No
         """
         UPDATE poller.codesystem_sync_state
         SET last_seen_at = now(),
-            endpoint_url = COALESCE(%s, endpoint_url)
+            endpoint_url = COALESCE(%s, endpoint_url),
+            active = true,
+            removed_at = NULL
         WHERE system_url = %s
         """,
         (endpoint_url, system_url),

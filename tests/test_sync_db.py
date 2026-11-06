@@ -146,3 +146,76 @@ class TestMetadata:
         poll(codesystem("A"))
         row = sync_state(pg)
         assert row["last_seen_at"] > row["synced_at"]
+
+
+# ── Phase 8: run summary ─────────────────────────────────────────────────
+
+OTHER = "https://fhir.example/fhir/CodeSystem/Other"
+
+
+class TestRunSummary:
+    def _run(self, entries, responses):
+        """responses: dict url -> fetch result (or Exception to raise)."""
+        def fake_fetch(url):
+            r = responses[url]
+            if isinstance(r, Exception):
+                raise r
+            return r
+        with patch.object(scheduler, "load_codesystems", return_value=entries), \
+             patch.object(scheduler, "fetch_codesystem", side_effect=fake_fetch):
+            return scheduler.run_poll_cycle()
+
+    def _last_run(self, pg):
+        pg.execute("SELECT * FROM poller.sync_run ORDER BY id DESC LIMIT 1")
+        return pg.fetchone()
+
+    def test_counters_and_details(self, pg):
+        entries = [ENTRY, CodeSystemEntry(url=OTHER, canonical_url=OTHER),
+                   CodeSystemEntry(url=OTHER + "2", canonical_url=OTHER + "2")]
+        self._run(entries, {SYSTEM: codesystem("A"), OTHER: None, OTHER + "2": RuntimeError("kaboom")})
+        self._run(entries, {SYSTEM: codesystem("A"), OTHER: codesystem("A", content="fragment"),
+                            OTHER + "2": None})
+
+        run = self._last_run(pg)
+        assert run["finished_at"] is not None
+        assert run["discovered"] == 3
+        assert (run["unchanged"], run["changed"], run["skipped"], run["failed"]) == (1, 0, 1, 1)
+        statuses = {d["system_url"]: d["status"] for d in run["details"]}
+        assert statuses == {SYSTEM: "unchanged", OTHER: "skipped", OTHER + "2": "failed"}
+
+        pg.execute("SELECT * FROM poller.sync_run ORDER BY id LIMIT 1")
+        first = pg.fetchone()
+        assert (first["changed"], first["failed"]) == (1, 2)
+        detail = next(d for d in first["details"] if d["system_url"] == SYSTEM)
+        assert (detail["added"], detail["modified"], detail["removed"]) == (1, 0, 0)
+        assert any("kaboom" in (d["error"] or "") for d in first["details"])
+
+    def test_unconfigured_codesystem_marked_inactive_then_revived(self, pg):
+        other = CodeSystemEntry(url=OTHER, canonical_url=OTHER)
+        self._run([ENTRY, other], {SYSTEM: codesystem("A"), OTHER: codesystem("B")})
+        self._run([ENTRY], {SYSTEM: codesystem("A")})
+
+        pg.execute("SELECT system_url, active, removed_at FROM poller.codesystem_sync_state")
+        rows = {r["system_url"]: r for r in pg.fetchall()}
+        assert rows[SYSTEM]["active"] is True
+        assert rows[OTHER]["active"] is False and rows[OTHER]["removed_at"] is not None
+        # concepts of the inactive CodeSystem are untouched and no events emitted
+        assert outbox(pg).count(("concept_removed", "B")) == 0
+
+        # back in config with unchanged content (hash match) → reactivated
+        self._run([ENTRY, other], {SYSTEM: codesystem("A"), OTHER: codesystem("B")})
+        pg.execute("SELECT active, removed_at FROM poller.codesystem_sync_state WHERE system_url = %s", (OTHER,))
+        row = pg.fetchone()
+        assert row["active"] is True and row["removed_at"] is None
+
+    def test_staleness_query(self, pg):
+        self._run([ENTRY], {SYSTEM: codesystem("A")})
+        stale_sql = """
+            SELECT system_url FROM poller.codesystem_sync_state
+            WHERE active AND (last_seen_at IS NULL OR last_seen_at < now() - interval '26 hours')
+        """
+        pg.execute(stale_sql)
+        assert pg.fetchall() == []
+        pg.execute("UPDATE poller.codesystem_sync_state SET last_seen_at = now() - interval '3 days'")
+        pg.execute(stale_sql)
+        assert [r["system_url"] for r in pg.fetchall()] == [SYSTEM]
