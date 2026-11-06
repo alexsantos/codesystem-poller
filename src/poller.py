@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 
 import httpx
 
@@ -16,32 +17,61 @@ from src.config import settings
 logger = logging.getLogger(__name__)
 
 
-def fetch_codesystem(url: str) -> tuple[bytes, dict] | None:
+RETRY_BACKOFF = (2, 8, 30)  # seconds before retry 1, 2, 3 (last value repeats)
+
+
+def _is_retryable_status(status: int) -> bool:
+    return status == 429 or status >= 500
+
+
+def fetch_codesystem(
+    url: str,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[bytes, dict] | None:
     """
     GET the FHIR CodeSystem endpoint.
     Returns (raw_bytes, parsed_json) or None on failure.
+
+    Network errors, 5xx and 429 are retried up to HTTP_RETRIES times with
+    backoff (2s, 8s, 30s); other 4xx are not retried.
     """
-    try:
-        with httpx.Client(timeout=settings.http_timeout) as client:
-            resp = client.get(
-                url,
-                headers={"Accept": "application/fhir+json"},
+    attempts = settings.http_retries + 1
+    with httpx.Client(timeout=settings.http_timeout, transport=transport) as client:
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = client.get(url, headers={"Accept": "application/fhir+json"})
+                resp.raise_for_status()
+                raw = resp.content
+                parsed = resp.json()
+                logger.info(
+                    "Fetched CodeSystem: %d bytes, resourceType=%s",
+                    len(raw),
+                    parsed.get("resourceType"),
+                )
+                return raw, parsed
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if not _is_retryable_status(status):
+                    logger.error("FHIR API returned %s for %s (not retried)", status, url)
+                    return None
+                error = f"HTTP {status}"
+            except httpx.RequestError as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            except ValueError as exc:  # body is not JSON
+                logger.error("FHIR API returned a non-JSON body for %s: %s", url, exc)
+                return None
+
+            if attempt == attempts:
+                logger.error("FHIR API request failed for %s after %d attempt(s): %s", url, attempts, error)
+                return None
+            delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+            logger.warning(
+                "FHIR API request failed for %s (attempt %d/%d): %s; retrying in %ds",
+                url, attempt, attempts, error, delay,
             )
-            resp.raise_for_status()
-            raw = resp.content
-            parsed = resp.json()
-            logger.info(
-                "Fetched CodeSystem: %d bytes, resourceType=%s",
-                len(raw),
-                parsed.get("resourceType"),
-            )
-            return raw, parsed
-    except httpx.HTTPStatusError as exc:
-        logger.error("FHIR API returned %s: %s", exc.response.status_code, exc)
-        return None
-    except httpx.RequestError as exc:
-        logger.error("FHIR API request failed: %s", exc)
-        return None
+            time.sleep(delay)
+    return None
 
 
 def compute_hash(raw: bytes, parsed: dict | None = None) -> str:

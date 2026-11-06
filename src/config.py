@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     # General
     log_level: str = "INFO"
     http_timeout: int = 30
+    http_retries: int = 3  # retries (after the first attempt) on network errors, 5xx, 429
 
     # extra="ignore": .env also holds compose-only keys (POSTGRES_*, COMPOSE_PROFILES, ...)
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
