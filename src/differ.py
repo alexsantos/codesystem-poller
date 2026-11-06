@@ -99,12 +99,16 @@ def _hash_concept(flat: dict) -> str:
 # ─── Loading stored state ───────────────────────────────────────────────
 
 def load_stored_concepts(cur, system_url: str) -> dict[str, dict]:
-    """Load all concept rows for a given system_url into a dict keyed by code."""
+    """Load the live (active) concept rows for a system_url, keyed by code.
+
+    Soft-deleted concepts are ignored, so a code that reappears is reported
+    as added (and revived by persist_state).
+    """
     cur.execute(
         """
         SELECT code, display, definition, concept_hash, properties, parent_code
         FROM poller.codesystem_concept_state
-        WHERE system_url = %s
+        WHERE system_url = %s AND active
         """,
         (system_url,),
     )
@@ -190,7 +194,7 @@ def persist_state(
     """
     In the CURRENT transaction (caller manages commit):
       1. UPSERT codesystem_sync_state
-      2. UPSERT/DELETE codesystem_concept_state
+      2. UPSERT codesystem_concept_state; soft-delete removed concepts
       3. INSERT change_outbox rows
     """
     # 1. Sync state
@@ -220,6 +224,8 @@ def persist_state(
                 concept_hash = EXCLUDED.concept_hash,
                 properties = EXCLUDED.properties,
                 parent_code = EXCLUDED.parent_code,
+                active = true,
+                removed_at = NULL,
                 updated_at = now()
             """,
             (
@@ -233,10 +239,14 @@ def persist_state(
             ),
         )
 
-    # 2b. Delete removed concepts
+    # 2b. Soft-delete removed concepts (row kept as history, active = false)
     for concept in removed:
         cur.execute(
-            "DELETE FROM poller.codesystem_concept_state WHERE system_url = %s AND code = %s",
+            """
+            UPDATE poller.codesystem_concept_state
+            SET active = false, removed_at = now(), updated_at = now()
+            WHERE system_url = %s AND code = %s
+            """,
             (system_url, concept["code"]),
         )
 
