@@ -3,8 +3,10 @@
 ## Purpose
 
 This service polls an external FHIR R4 API that exposes a `CodeSystem` resource,
-detects changes (new, modified, or removed concepts), and emits FHIR R4 message
-Bundles as RabbitMQ events. It is designed for environments where the source system
+keeps a local queryable copy of its concepts in PostgreSQL, detects changes (new,
+modified, or removed concepts), and delivers FHIR R4 message Bundles — to RabbitMQ
+or directly to a FHIR `$process-message` endpoint — at least once. The relay can be
+disabled for a database-only deployment. It is designed for environments where the source system
 provides **no push notifications, no usable ETag, and no `meta.lastUpdated`**.
 
 ## Architecture
@@ -38,24 +40,27 @@ provides **no push notifications, no usable ETag, and no `meta.lastUpdated`**.
 ┌───────────────────────────────────────────────────────────┐
 │  PostgreSQL transaction (single tx, atomic)               │
 │  1. UPSERT codesystem_sync_state (new hash, json, etc.)  │
-│  2. UPSERT/DELETE codesystem_concept_state rows           │
+│  2. UPSERT / soft-delete codesystem_concept_state rows    │
 │  3. INSERT change_outbox rows (one per change)            │
 └──────┬────────────────────────────────────────────────────┘
        │
        ▼
 ┌───────────────┐
-│  Outbox Relay │  Polls change_outbox for unpublished rows
-│  (background) │  Builds a FHIR R4 message Bundle
-│               │  Publishes to RabbitMQ exchange
-│               │  Marks outbox rows as published
+│  Outbox Relay │  RELAY_ENABLED (default true). Seals unpublished rows into
+│  (background) │  outbox_batch (frozen Bundle, id = batch id), delivers in order
+│               │  per CodeSystem, retries with backoff, marks rows published
+│               │  only after the target confirms
 └──────┬────────┘
-       │
-       ▼
-┌───────────────┐
-│  RabbitMQ     │  Topic exchange: codesystem.changes
-│               │  Routing keys: codesystem.<system_url_slug>.changed
-└───────────────┘
+       │ RELAY_TARGET
+       ├── rabbitmq ─▶ Topic exchange codesystem.changes,
+       │               routing key codesystem.<system_url_slug>.changed
+       │               (publisher confirms + mandatory)
+       └── fhir ─────▶ POST FHIR_TARGET_URL ($process-message), no RabbitMQ
 ```
+
+Before the diff, a response with `content != complete` or a `count` that differs
+from the flattened concepts is skipped without touching state (Phase 4 guard).
+Every run is recorded in `poller.sync_run`.
 
 ## Key Design Decisions
 
@@ -80,7 +85,19 @@ atomic. If we published directly to RabbitMQ and crashed before committing the n
 state to PG, the next cycle would re-detect the same changes and emit duplicates.
 The outbox table lives in PG, so the INSERT of outbox rows happens in the same
 transaction as the state update. A separate relay process picks up unpublished rows
-and publishes them to RabbitMQ, then marks them as published.
+and delivers them (RabbitMQ or FHIR), then marks them as published.
+
+### How is delivery guaranteed?
+At-least-once, ordered per CodeSystem. The relay seals rows into `outbox_batch`
+with the Bundle frozen in the row; `Bundle.id` = `MessageHeader.id` = batch id,
+so a redelivery after a crash is byte-identical and receivers deduplicate by id.
+Rows are marked published only after the target confirms (RabbitMQ publisher
+confirm + routed; FHIR 2xx without a transient/fatal response code). Transient
+failures retry forever with exponential backoff; rejected Bundles
+(400/409/410/413/415/422, fatal-error) become `dead` and are handled per
+`RELAY_ON_REJECT` (`dead_letter` continues, `block` holds the CodeSystem).
+`python -m src.outbox_admin` lists/requeues/discards. An advisory lock keeps a
+single active relay.
 
 ### Why FHIR message Bundles?
 Downstream consumers stay in FHIR-land. The Bundle type is `message`, the first
@@ -105,21 +122,24 @@ codesystem-poller/
 ├── .env.example
 ├── codesystems.yml            ← list of CodeSystems to monitor (gitignored)
 ├── codesystems.yml.example    ← template committed to the repo
-├── migrations/
-│   └── 001_init.sql           ← PG schema: sync_state, concept_state, change_outbox
+├── migrations/                ← re-applied on every start: 002+ must be idempotent
+│   ├── 001_init.sql           ← PG schema: sync_state, concept_state, change_outbox
+│   ├── 002_daily_sync.sql     ← metadata, last_seen_at, concept soft delete, sync_run
+│   └── 003_outbox_delivery.sql ← outbox_batch (guaranteed delivery)
 ├── src/
 │   ├── __init__.py
 │   ├── config.py              ← pydantic-settings, env vars, CodeSystemEntry, load_codesystems()
 │   ├── db.py                  ← psycopg3 connection pool, transaction helper
-│   ├── poller.py              ← HTTP fetch + raw hash check (accepts url param)
+│   ├── poller.py              ← HTTP fetch (with retries) + raw hash check
 │   ├── differ.py              ← concept flattening + diffing logic
 │   ├── fhir_bundle.py         ← FHIR R4 message Bundle builder
 │   ├── fhir_forwarder.py      ← RabbitMQ consumer → POST to FHIR $process-message
-│   ├── outbox_relay.py        ← reads outbox, builds Bundle, publishes to RabbitMQ
-│   ├── scheduler.py           ← iterates over CodeSystems, runs poll cycle per entry
+│   ├── outbox_relay.py        ← seals outbox into batches, delivers with retries
+│   ├── delivery.py            ← delivery targets: RabbitMQ (confirms) / FHIR $process-message
+│   ├── outbox_admin.py        ← CLI: delivery status, dead batches, requeue/discard
+│   ├── scheduler.py           ← iterates CodeSystems, completeness guard, sync_run
 │   └── main.py                ← boots scheduler + outbox relay
-└── tests/
-    └── test_differ.py         ← unit tests for the differ
+└── tests/                     ← unit tests; *_db tests need TEST_DATABASE_URL
 ```
 
 ## Configuration (environment variables)
@@ -133,8 +153,18 @@ codesystem-poller/
 | `RABBITMQ_URL` | `amqp://guest:guest@rabbitmq:5672/` | RabbitMQ connection string |
 | `RABBITMQ_EXCHANGE` | `codesystem.changes` | Topic exchange name |
 | `OUTBOX_POLL_INTERVAL` | `5` | Seconds between outbox relay cycles |
+| `RELAY_ENABLED` | `true` | `false` = database-only (outbox kept as history, not delivered) |
+| `RELAY_TARGET` | `rabbitmq` | `rabbitmq` or `fhir` (direct POST to `FHIR_TARGET_URL`) |
+| `FHIR_TARGET_URL` | — | `$process-message` URL for `RELAY_TARGET=fhir` and the forwarder |
+| `FHIR_AUTH_TOKEN` / `FHIR_AUTH_USER` / `FHIR_AUTH_PASSWORD` | — | Downstream auth |
+| `RELAY_BATCH_SIZE` | `500` | Max changes per Bundle |
+| `RELAY_RETRY_BASE` / `RELAY_RETRY_MAX` | `5` / `900` | Delivery backoff seconds (doubling, capped; never gives up) |
+| `RELAY_ON_REJECT` | `dead_letter` | `dead_letter` or `block` for rejected Bundles |
+| `ALLOW_COUNT_MISMATCH` | `false` | Accept responses whose `count` ≠ concepts returned |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `HTTP_TIMEOUT` | `30` | Seconds for the FHIR API request timeout |
+| `HTTP_RETRIES` | `3` | Fetch retries on network errors, 5xx, 429 (2s, 8s, 30s) |
+| `COMPOSE_PROFILES` | — | Compose only: `messaging` starts RabbitMQ, `forwarder` the forwarder |
 
 ## CodeSystems Config File
 
@@ -158,21 +188,33 @@ codesystems:
 
 Each CodeSystem gets its own rows in `codesystem_sync_state` and
 `codesystem_concept_state`. The scheduler iterates over all entries sequentially
-on each cron tick.
+on each cron tick. CodeSystems removed from the file are marked `active = false`
+(no events) and reactivated if they come back.
+
+The IMTHOM server supports only `read` on CodeSystem (no search), and
+`CodeSystem.url` is the endpoint URL, so automatic discovery and re-keying by
+`CodeSystem.url` (PLAN.md Phases 6/7) are not implemented; the YAML is the
+source of truth.
 
 ## Database Schema
 
 Three tables in a `poller` schema:
 
 - **`poller.codesystem_sync_state`** — one row per monitored CodeSystem. Stores the
-  last seen resource_hash, the full FHIR JSON (for disaster recovery), and the
-  sync timestamp.
+  last seen resource_hash, the full FHIR JSON (for disaster recovery), name/title/
+  content/endpoint_url, `synced_at` (last content change), `last_seen_at` (last
+  successful fetch, for staleness alerts), and `active`.
 - **`poller.codesystem_concept_state`** — one row per concept code per CodeSystem.
   Stores display, definition, concept_hash, properties (jsonb), and parent_code.
-  This is the row-level comparison target.
+  Removed concepts are soft-deleted (`active = false`, `removed_at`); readers must
+  filter `WHERE active`. This is the row-level comparison target (active rows only).
 - **`poller.change_outbox`** — append-only. One row per detected change. Carries
-  change_type, code, old/new values as JSONB. The `published` flag is flipped by
-  the outbox relay after successful RabbitMQ publish.
+  change_type, code, old/new values as JSONB, and `batch_id` once sealed. The
+  `published` flag is flipped when its batch is confirmed by the target.
+- **`poller.outbox_batch`** — one row per Bundle: frozen `bundle`, `status`
+  (pending/delivered/dead/discarded), `attempts`, `next_attempt_at`, `last_error`.
+- **`poller.sync_run`** — one row per scheduled run with counters and per-CodeSystem
+  details.
 
 ## Diff Logic
 
@@ -183,7 +225,7 @@ Three tables in a `poller` schema:
 3. Load current `codesystem_concept_state` rows from PG → also index by code.
 4. Three-way comparison:
    - **Added**: code in fresh, not in stored.
-   - **Removed**: code in stored, not in fresh.
+   - **Removed**: code in stored (active), not in fresh.
    - **Modified**: code in both, but `concept_hash` differs. Then field-level diff
      to identify exactly which fields changed (display, definition, properties,
      parent_code).
@@ -191,10 +233,13 @@ Three tables in a `poller` schema:
 
 ## RabbitMQ Events
 
-The outbox relay collects all unpublished outbox rows, groups them by CodeSystem,
-builds one FHIR message Bundle per CodeSystem per relay cycle, and publishes it
-to the topic exchange with routing key:
-`codesystem.<slugified_system_url>.changed`
+The outbox relay seals unpublished outbox rows, grouped by CodeSystem, into
+batches of up to `RELAY_BATCH_SIZE` changes, one FHIR message Bundle each, and
+publishes them to the topic exchange with routing key
+`codesystem.<slugified_system_url>.changed` and `message_id` = Bundle id.
+With `RELAY_TARGET=fhir` the same Bundles are POSTed to `FHIR_TARGET_URL` instead.
+
+Note: the first poll of a CodeSystem emits every concept as `concept_added`.
 
 Consumers bind queues to this exchange with the routing key pattern they care about.
 
@@ -206,14 +251,17 @@ cp .env.example .env                          # edit credentials
 docker compose up -d
 ```
 
-This starts PostgreSQL, RabbitMQ, runs the migration, and launches the poller
-service. Logs go to stdout (docker compose logs -f poller).
+This starts PostgreSQL, RabbitMQ (when `COMPOSE_PROFILES=messaging`), runs the
+migrations, and launches the poller service. Logs go to stdout (docker compose logs -f poller).
 
 ## Development Commands
 
 ```bash
-# Run tests
+# Run tests (DB tests need TEST_DATABASE_URL pointing at a THROWAWAY database)
 docker compose run --rm poller python -m pytest tests/ -v
+
+# Delivery status / dead batches / requeue
+docker compose exec poller python -m src.outbox_admin status
 
 # Run a manual poll cycle (bypasses scheduler)
 docker compose run --rm poller python -c "from src.scheduler import run_poll_cycle; run_poll_cycle()"
@@ -221,17 +269,21 @@ docker compose run --rm poller python -c "from src.scheduler import run_poll_cyc
 # Check outbox state
 docker compose exec db psql -U poller -d codesystem_poller -c "SELECT id, change_type, code, published, created_at FROM poller.change_outbox ORDER BY id DESC LIMIT 20;"
 
-# Reset state (re-triggers full diff on next poll)
-docker compose exec db psql -U poller -d codesystem_poller -c "TRUNCATE poller.codesystem_sync_state, poller.codesystem_concept_state, poller.change_outbox;"
+# Reset state (next poll re-emits every concept as concept_added)
+docker compose exec db psql -U poller -d codesystem_poller -c "TRUNCATE poller.codesystem_sync_state, poller.codesystem_concept_state, poller.change_outbox, poller.outbox_batch, poller.sync_run;"
 ```
 
 ## Failure Modes
 
 | Failure | Behaviour |
 |---|---|
-| FHIR API unreachable | Log error, skip cycle, retry on next cron tick. State untouched. |
-| FHIR API returns non-200 | Same as above. |
+| FHIR API unreachable | Retried `HTTP_RETRIES` times, then logged as failed in `sync_run`; retry next cron tick. State untouched. |
+| FHIR API returns non-200 | 5xx/429 retried as above; other 4xx not retried. |
+| Partial CodeSystem | `content != complete` or `count` mismatch → skipped, state untouched. |
 | PG transaction fails | Nothing committed — no partial state, no outbox rows. Next cycle retries. |
-| RabbitMQ down | Outbox rows remain `published=false`. Relay retries every `OUTBOX_POLL_INTERVAL` seconds. Events are delivered once RabbitMQ recovers. |
+| RabbitMQ / FHIR target down | Batch stays `pending`, retried with exponential backoff forever. Delivered once the target recovers. |
+| No queue bound to the exchange | Unroutable → retried, not dropped. |
+| Target rejects a Bundle | Batch `dead` (ERROR log); `RELAY_ON_REJECT` decides whether later batches continue. Requeue/discard via `src.outbox_admin`. |
+| Crash after target accepted, before commit | Same Bundle (same id) resent; receiver deduplicates. |
 | Service restart | Reads last committed state from PG. Only diffs against that — no full-table re-notification. |
 | Phantom diffs (non-deterministic JSON) | Set `CANONICAL_HASH=true` to eliminate. |
