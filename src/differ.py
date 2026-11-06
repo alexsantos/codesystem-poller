@@ -180,6 +180,59 @@ def _field_diff(old: dict, new: dict) -> dict[str, tuple[Any, Any]]:
 
 # ─── Persisting new state ───────────────────────────────────────────────
 
+def upsert_sync_state(
+    cur,
+    system_url: str,
+    resource_hash: str,
+    resource_json: dict,
+    endpoint_url: str | None = None,
+) -> None:
+    """UPSERT the CodeSystem-level row (hash, snapshot, metadata, timestamps)."""
+    cur.execute(
+        """
+        INSERT INTO poller.codesystem_sync_state
+            (system_url, version, resource_hash, resource_json, synced_at,
+             endpoint_url, name, title, content, active, last_seen_at, removed_at)
+        VALUES (%s, %s, %s, %s::jsonb, now(), %s, %s, %s, %s, true, now(), NULL)
+        ON CONFLICT (system_url) DO UPDATE SET
+            version = EXCLUDED.version,
+            resource_hash = EXCLUDED.resource_hash,
+            resource_json = EXCLUDED.resource_json,
+            synced_at = now(),
+            endpoint_url = COALESCE(EXCLUDED.endpoint_url, poller.codesystem_sync_state.endpoint_url),
+            name = EXCLUDED.name,
+            title = EXCLUDED.title,
+            content = EXCLUDED.content,
+            active = true,
+            last_seen_at = now(),
+            removed_at = NULL
+        """,
+        (
+            system_url,
+            resource_json.get("version"),
+            resource_hash,
+            json.dumps(resource_json),
+            endpoint_url,
+            resource_json.get("name"),
+            resource_json.get("title"),
+            resource_json.get("content"),
+        ),
+    )
+
+
+def touch_last_seen(cur, system_url: str, endpoint_url: str | None = None) -> None:
+    """Record a successful fetch whose content did not change."""
+    cur.execute(
+        """
+        UPDATE poller.codesystem_sync_state
+        SET last_seen_at = now(),
+            endpoint_url = COALESCE(%s, endpoint_url)
+        WHERE system_url = %s
+        """,
+        (endpoint_url, system_url),
+    )
+
+
 def persist_state(
     cur,
     system_url: str,
@@ -190,26 +243,19 @@ def persist_state(
     added: list[dict],
     modified: list[dict],
     removed: list[dict],
+    endpoint_url: str | None = None,
 ) -> None:
     """
     In the CURRENT transaction (caller manages commit):
       1. UPSERT codesystem_sync_state
       2. UPSERT codesystem_concept_state; soft-delete removed concepts
       3. INSERT change_outbox rows
+
+    `version` is kept for backwards compatibility; the stored version is
+    taken from resource_json.
     """
     # 1. Sync state
-    cur.execute(
-        """
-        INSERT INTO poller.codesystem_sync_state (system_url, version, resource_hash, resource_json, synced_at)
-        VALUES (%s, %s, %s, %s::jsonb, now())
-        ON CONFLICT (system_url) DO UPDATE SET
-            version = EXCLUDED.version,
-            resource_hash = EXCLUDED.resource_hash,
-            resource_json = EXCLUDED.resource_json,
-            synced_at = now()
-        """,
-        (system_url, version, resource_hash, json.dumps(resource_json)),
-    )
+    upsert_sync_state(cur, system_url, resource_hash, resource_json, endpoint_url)
 
     # 2a. Upsert all fresh concepts
     for concept in fresh_concepts.values():

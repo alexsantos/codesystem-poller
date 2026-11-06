@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     relay_enabled: bool = True
     outbox_poll_interval: int = 5  # seconds
 
+    # Safety: skip a CodeSystem whose `count` differs from the number of
+    # concepts returned (server truncation/paging). Set true if the source's
+    # `count` turns out to be unreliable.
+    allow_count_mismatch: bool = False
+
     # General
     log_level: str = "INFO"
     http_timeout: int = 30

@@ -5,15 +5,36 @@ Uses APScheduler with a cron trigger.
 
 from __future__ import annotations
 
-import json
 import logging
 
 from src.config import CodeSystemEntry, load_codesystems, settings
 from src.db import transaction
-from src.differ import diff_concepts, flatten_concepts, load_stored_concepts, persist_state
+from src.differ import (
+    diff_concepts,
+    flatten_concepts,
+    load_stored_concepts,
+    persist_state,
+    touch_last_seen,
+    upsert_sync_state,
+)
 from src.poller import compute_hash, fetch_codesystem, get_stored_hash
 
 logger = logging.getLogger(__name__)
+
+
+def check_completeness(parsed: dict, fresh_concepts: dict[str, dict]) -> str | None:
+    """Return a reason to skip this response, or None if it is safe to diff."""
+    content = parsed.get("content")
+    if content is not None and content != "complete":
+        return f"CodeSystem.content is '{content}', not 'complete'"
+
+    count = parsed.get("count")
+    if count is not None and count != len(fresh_concepts) and not settings.allow_count_mismatch:
+        return (
+            f"CodeSystem.count is {count} but {len(fresh_concepts)} concepts were returned "
+            "(set ALLOW_COUNT_MISMATCH=true if the source's count is unreliable)"
+        )
+    return None
 
 
 def _poll_one(entry: CodeSystemEntry) -> None:
@@ -37,40 +58,36 @@ def _poll_one(entry: CodeSystemEntry) -> None:
 
         if stored_hash == current_hash:
             logger.info("No change detected for %s (hash match), skipping diff", system_url)
+            touch_last_seen(cur, system_url, entry.url)
             return
 
         logger.info("Hash changed for %s: stored=%s, current=%s", system_url, stored_hash, current_hash)
 
-        # ── Step 3: Flatten + diff ───────────────────────────────────────
+        # ── Step 3: Flatten + guard against partial content ──────────────
         concepts_list = parsed.get("concept", [])
         fresh_concepts = flatten_concepts(concepts_list)
-        stored_concepts = load_stored_concepts(cur, system_url)
 
+        skip_reason = check_completeness(parsed, fresh_concepts)
+        if skip_reason:
+            # Diffing a partial CodeSystem would report most concepts as removed.
+            logger.warning("Skipping %s, state left untouched: %s", system_url, skip_reason)
+            return
+
+        # ── Step 4: Diff ─────────────────────────────────────────────────
+        stored_concepts = load_stored_concepts(cur, system_url)
         added, modified, removed = diff_concepts(fresh_concepts, stored_concepts)
 
         if not added and not modified and not removed:
             # Hash changed (e.g., metadata shift) but no concept-level changes.
             # Still update the hash so we don't re-parse next time.
             logger.info("Resource hash changed but no concept diffs for %s; updating hash only", system_url)
-            cur.execute(
-                """
-                INSERT INTO poller.codesystem_sync_state (system_url, version, resource_hash, resource_json, synced_at)
-                VALUES (%s, %s, %s, %s::jsonb, now())
-                ON CONFLICT (system_url) DO UPDATE SET
-                    version = EXCLUDED.version,
-                    resource_hash = EXCLUDED.resource_hash,
-                    resource_json = EXCLUDED.resource_json,
-                    synced_at = now()
-                """,
-                (system_url, parsed.get("version"), current_hash, json.dumps(parsed)),
-            )
+            upsert_sync_state(cur, system_url, current_hash, parsed, entry.url)
             return
 
-        # ── Step 4: Persist (state + outbox) in one transaction ──────────
-        version = parsed.get("version")
+        # ── Step 5: Persist (state + outbox) in one transaction ──────────
         persist_state(
-            cur, system_url, version, current_hash, parsed,
-            fresh_concepts, added, modified, removed,
+            cur, system_url, parsed.get("version"), current_hash, parsed,
+            fresh_concepts, added, modified, removed, endpoint_url=entry.url,
         )
 
     logger.info(
