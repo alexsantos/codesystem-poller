@@ -16,7 +16,6 @@ from apscheduler.triggers.cron import CronTrigger
 
 from src.config import load_codesystems, settings
 from src.db import check_health
-from src.outbox_relay import run_relay_loop
 from src.scheduler import run_poll_cycle
 
 logging.basicConfig(
@@ -62,6 +61,10 @@ def main() -> None:
         logger.info("    - %s", entry.canonical_url)
     logger.info("  Poll cron:      %s", settings.poll_cron)
     logger.info("  Canonical hash: %s", settings.canonical_hash)
+    if settings.relay_enabled:
+        logger.info("  Outbox relay:   enabled (interval=%ds)", settings.outbox_poll_interval)
+    else:
+        logger.info("  Outbox relay:   DISABLED (database-only mode; outbox rows are kept, not published)")
 
     # Wait for PG to be ready
     _wait_for_db()
@@ -74,8 +77,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     # Start outbox relay in a non-daemon thread so it can finish cleanly
-    relay_thread = threading.Thread(target=_relay_loop_with_shutdown, name="outbox-relay")
-    relay_thread.start()
+    relay_thread: threading.Thread | None = None
+    if settings.relay_enabled:
+        relay_thread = threading.Thread(target=_relay_loop_with_shutdown, name="outbox-relay")
+        relay_thread.start()
 
     # Run an immediate poll on startup, then schedule the cron
     logger.info("Running initial poll cycle on startup")
@@ -103,7 +108,8 @@ def main() -> None:
         logger.info("Shutting down")
     finally:
         _shutdown.set()
-        relay_thread.join(timeout=10)
+        if relay_thread is not None:
+            relay_thread.join(timeout=10)
         logger.info("Shutdown complete")
 
 

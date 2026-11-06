@@ -34,9 +34,17 @@ services:
         echo "Migrations done."
       '
 
-  # ── RabbitMQ ────────────────────────────────────────────
+  # ── RabbitMQ (optional) ─────────────────────────────────
+  # Only needed when RELAY_ENABLED=true and RELAY_TARGET=rabbitmq, or for the
+  # forwarder. Enabled by the `messaging` (or `forwarder`) profile:
+  #   docker compose --profile messaging up -d
+  # or set COMPOSE_PROFILES=messaging in .env (plain `docker compose up` then
+  # includes it, which is what codesystem-poller.service runs).
   rabbitmq:
     image: rabbitmq:4-management-alpine
+    profiles:
+      - messaging
+      - forwarder
     hostname: rabbitmq
     user: rabbitmq
     environment:
@@ -59,6 +67,7 @@ services:
         condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
+        required: false   # waited for only when its profile is active
     env_file:
       - .env
     environment:

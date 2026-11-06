@@ -26,13 +26,17 @@ class Settings(BaseSettings):
     rabbitmq_exchange: str = "codesystem.changes"
 
     # Outbox relay
+    # When false, outbox rows are still written (they are the change history)
+    # but nothing is published. Re-enabling later delivers the whole backlog.
+    relay_enabled: bool = True
     outbox_poll_interval: int = 5  # seconds
 
     # General
     log_level: str = "INFO"
     http_timeout: int = 30
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # extra="ignore": .env also holds compose-only keys (POSTGRES_*, COMPOSE_PROFILES, ...)
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 @dataclass
