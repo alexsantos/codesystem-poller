@@ -133,7 +133,7 @@ codesystem-poller/
 │   ├── poller.py              ← HTTP fetch (with retries) + raw hash check
 │   ├── differ.py              ← concept flattening + diffing logic
 │   ├── fhir_bundle.py         ← FHIR R4 message Bundle builder
-│   ├── fhir_forwarder.py      ← RabbitMQ consumer → POST to FHIR $process-message
+│   ├── fhir_forwarder.py      ← RabbitMQ consumer → POST to FHIR $process-message (rejects → <queue>.dead)
 │   ├── outbox_relay.py        ← seals outbox into batches, delivers with retries
 │   ├── delivery.py            ← delivery targets: RabbitMQ (confirms) / FHIR $process-message
 │   ├── outbox_admin.py        ← CLI: delivery status, dead batches, requeue/discard
@@ -284,6 +284,7 @@ docker compose exec db psql -U poller -d codesystem_poller -c "TRUNCATE poller.c
 | RabbitMQ / FHIR target down | Batch stays `pending`, retried with exponential backoff forever. Delivered once the target recovers. |
 | No queue bound to the exchange | Unroutable → retried, not dropped. |
 | Target rejects a Bundle | Batch `dead` (ERROR log); `RELAY_ON_REJECT` decides whether later batches continue. Requeue/discard via `src.outbox_admin`. |
+| Forwarder: endpoint rejects a Bundle | Copied to `fhir-forwarder.dead` (confirmed) then ACKed; endpoint/auth errors are requeued, not dead-lettered. |
 | Crash after target accepted, before commit | Same Bundle (same id) resent; receiver deduplicates. |
 | Service restart | Reads last committed state from PG. Only diffs against that — no full-table re-notification. |
 | Phantom diffs (non-deterministic JSON) | Set `CANONICAL_HASH=true` to eliminate. |

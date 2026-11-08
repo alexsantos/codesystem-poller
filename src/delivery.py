@@ -143,6 +143,30 @@ def _message_response_code(text: str) -> str | None:
     return None
 
 
+def classify_response(resp: httpx.Response) -> DeliveryResult:
+    """
+    Classify a $process-message HTTP response (shared by the relay's FhirTarget
+    and the RabbitMQ forwarder).
+
+    2xx is OK unless the reply's MessageHeader.response.code says otherwise.
+    REJECT_STATUSES mean the Bundle itself was refused. Every other status
+    (401/403/404/408/429/5xx…) is an endpoint or configuration problem that
+    affects all Bundles alike, so it is retried rather than dead-lettered.
+    """
+    status = resp.status_code
+    snippet = resp.text[:500]
+    if 200 <= status < 300:
+        code = _message_response_code(resp.text)
+        if code == "transient-error":
+            return DeliveryResult(Outcome.RETRY, f"HTTP {status}, response code transient-error: {snippet}")
+        if code == "fatal-error":
+            return DeliveryResult(Outcome.REJECTED, f"HTTP {status}, response code fatal-error: {snippet}")
+        return DeliveryResult(Outcome.OK, f"HTTP {status}")
+    if status in REJECT_STATUSES:
+        return DeliveryResult(Outcome.REJECTED, f"HTTP {status}: {snippet}")
+    return DeliveryResult(Outcome.RETRY, f"HTTP {status}: {snippet}")
+
+
 class FhirTarget:
     """POSTs the Bundle to a FHIR $process-message endpoint."""
 
@@ -173,18 +197,7 @@ class FhirTarget:
         except httpx.RequestError as exc:
             return DeliveryResult(Outcome.RETRY, f"{type(exc).__name__}: {exc}")
 
-        status = resp.status_code
-        snippet = resp.text[:500]
-        if 200 <= status < 300:
-            code = _message_response_code(resp.text)
-            if code == "transient-error":
-                return DeliveryResult(Outcome.RETRY, f"HTTP {status}, response code transient-error: {snippet}")
-            if code == "fatal-error":
-                return DeliveryResult(Outcome.REJECTED, f"HTTP {status}, response code fatal-error: {snippet}")
-            return DeliveryResult(Outcome.OK, f"HTTP {status}")
-        if status in REJECT_STATUSES:
-            return DeliveryResult(Outcome.REJECTED, f"HTTP {status}: {snippet}")
-        return DeliveryResult(Outcome.RETRY, f"HTTP {status}: {snippet}")
+        return classify_response(resp)
 
     def close(self) -> None:
         self._client.close()

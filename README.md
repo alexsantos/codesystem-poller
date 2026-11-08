@@ -536,7 +536,13 @@ docker run -d \
 
 **How it handles failures:**
 
-The forwarder retries with exponential backoff on transient errors (5xx, network failures). On 4xx it logs the rejection; on a 4xx or after retries are exhausted the message is NACKed **with requeue**, so a Bundle the endpoint always rejects loops forever. In production, configure a **dead-letter exchange (DLX)** on the `fhir-forwarder` queue, or prefer `RELAY_TARGET=fhir`, which parks rejected Bundles as dead instead.
+The forwarder classifies responses the same way as `RELAY_TARGET=fhir`:
+
+- **2xx** → ACK.
+- **Bundle rejected** (400, 409, 410, 413, 415, 422, or a `fatal-error` response code) → the message is copied to the durable dead-letter queue **`fhir-forwarder.dead`** (`RABBITMQ_DEAD_QUEUE`) and then ACKed. The ACK happens only after the broker confirms the copy; if the copy fails, the message is requeued, so it is never lost. Headers on the dead letter: `x-reject-reason`, `x-original-exchange`, `x-original-routing-key`, `x-rejected-at`; `message_id` is the Bundle id. Messages that are not JSON or not a FHIR message Bundle are dead-lettered the same way.
+- **Anything else** (5xx, 401, 403, 404, 429, network errors) → retried `MAX_RETRIES` times with exponential backoff, then NACKed with requeue. These are endpoint or configuration problems that would hit every Bundle, so they are retried and never dead-lettered. With prefetch 1, later Bundles wait, which keeps them in order.
+
+To replay dead letters after fixing the cause, move them back to `fhir-forwarder` (RabbitMQ management UI → Queues → `fhir-forwarder.dead` → *Move messages*, or a shovel). To drop them, purge the queue.
 
 | Forwarder variable | Default | Description |
 |---|---|---|
@@ -544,6 +550,7 @@ The forwarder retries with exponential backoff on transient errors (5xx, network
 | `FHIR_AUTH_TOKEN` | (empty) | Bearer token for authentication (omit if not needed) |
 | `RABBITMQ_QUEUE` | `fhir-forwarder` | Durable queue name for this consumer |
 | `RABBITMQ_ROUTING_KEY` | `codesystem.#` | Routing key pattern (`#` = all CodeSystems) |
+| `RABBITMQ_DEAD_QUEUE` | `<RABBITMQ_QUEUE>.dead` | Durable queue for rejected Bundles |
 | `MAX_RETRIES` | `3` | Retry attempts per message on transient failure |
 | `RETRY_DELAY` | `5` | Initial retry delay in seconds (doubles each retry) |
 
@@ -658,6 +665,7 @@ docker compose exec db psql -U poller -d codesystem_poller -c \
 | **RabbitMQ / FHIR target down** | Batches stay `pending`; the relay retries with exponential backoff (capped at `RELAY_RETRY_MAX`). | Delivered automatically once the target recovers. No manual intervention needed. |
 | **No queue bound to the exchange** | Publishing is unroutable, so it is retried rather than dropped. | Bind a queue (or start the forwarder). |
 | **Target rejects a Bundle** | Batch parked as `dead`, logged at ERROR. | `python -m src.outbox_admin dead`, fix the cause, then `requeue` (or `discard`). |
+| **Endpoint rejects a Bundle (forwarder)** | Copied to `fhir-forwarder.dead` with the reason in headers, then ACKed. | Fix the cause, then move the messages back to `fhir-forwarder` (management UI or shovel). |
 | **Crash after the target accepted, before recording** | The same Bundle (same id) is sent again. | Receivers deduplicate on `Bundle.id`. |
 | **Service crash mid-transaction** | PostgreSQL rolls back the uncommitted transaction. | Next cycle diffs against the last committed state. No re-notification. |
 | **Service crash after commit, before delivery** | Outbox rows exist but are unpublished. | Relay picks them up on restart. |
