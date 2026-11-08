@@ -5,6 +5,10 @@
 #                Optional — defaults to url if omitted.
 #
 # Copy this file to codesystems.yml and fill in your values.
+#
+# This file is the source of truth for what is synced: the source server only
+# supports `read` on CodeSystem, so there is no automatic discovery. A CodeSystem
+# removed from this list is marked inactive in the database (no events emitted).
 
 codesystems:
   - url: https://your-fhir-server.example/fhir/CodeSystem/FirstCodeSystem

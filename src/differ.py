@@ -99,12 +99,16 @@ def _hash_concept(flat: dict) -> str:
 # ─── Loading stored state ───────────────────────────────────────────────
 
 def load_stored_concepts(cur, system_url: str) -> dict[str, dict]:
-    """Load all concept rows for a given system_url into a dict keyed by code."""
+    """Load the live (active) concept rows for a system_url, keyed by code.
+
+    Soft-deleted concepts are ignored, so a code that reappears is reported
+    as added (and revived by persist_state).
+    """
     cur.execute(
         """
         SELECT code, display, definition, concept_hash, properties, parent_code
         FROM poller.codesystem_concept_state
-        WHERE system_url = %s
+        WHERE system_url = %s AND active
         """,
         (system_url,),
     )
@@ -176,6 +180,61 @@ def _field_diff(old: dict, new: dict) -> dict[str, tuple[Any, Any]]:
 
 # ─── Persisting new state ───────────────────────────────────────────────
 
+def upsert_sync_state(
+    cur,
+    system_url: str,
+    resource_hash: str,
+    resource_json: dict,
+    endpoint_url: str | None = None,
+) -> None:
+    """UPSERT the CodeSystem-level row (hash, snapshot, metadata, timestamps)."""
+    cur.execute(
+        """
+        INSERT INTO poller.codesystem_sync_state
+            (system_url, version, resource_hash, resource_json, synced_at,
+             endpoint_url, name, title, content, active, last_seen_at, removed_at)
+        VALUES (%s, %s, %s, %s::jsonb, now(), %s, %s, %s, %s, true, now(), NULL)
+        ON CONFLICT (system_url) DO UPDATE SET
+            version = EXCLUDED.version,
+            resource_hash = EXCLUDED.resource_hash,
+            resource_json = EXCLUDED.resource_json,
+            synced_at = now(),
+            endpoint_url = COALESCE(EXCLUDED.endpoint_url, poller.codesystem_sync_state.endpoint_url),
+            name = EXCLUDED.name,
+            title = EXCLUDED.title,
+            content = EXCLUDED.content,
+            active = true,
+            last_seen_at = now(),
+            removed_at = NULL
+        """,
+        (
+            system_url,
+            resource_json.get("version"),
+            resource_hash,
+            json.dumps(resource_json),
+            endpoint_url,
+            resource_json.get("name"),
+            resource_json.get("title"),
+            resource_json.get("content"),
+        ),
+    )
+
+
+def touch_last_seen(cur, system_url: str, endpoint_url: str | None = None) -> None:
+    """Record a successful fetch whose content did not change."""
+    cur.execute(
+        """
+        UPDATE poller.codesystem_sync_state
+        SET last_seen_at = now(),
+            endpoint_url = COALESCE(%s, endpoint_url),
+            active = true,
+            removed_at = NULL
+        WHERE system_url = %s
+        """,
+        (endpoint_url, system_url),
+    )
+
+
 def persist_state(
     cur,
     system_url: str,
@@ -186,26 +245,19 @@ def persist_state(
     added: list[dict],
     modified: list[dict],
     removed: list[dict],
+    endpoint_url: str | None = None,
 ) -> None:
     """
     In the CURRENT transaction (caller manages commit):
       1. UPSERT codesystem_sync_state
-      2. UPSERT/DELETE codesystem_concept_state
+      2. UPSERT codesystem_concept_state; soft-delete removed concepts
       3. INSERT change_outbox rows
+
+    `version` is kept for backwards compatibility; the stored version is
+    taken from resource_json.
     """
     # 1. Sync state
-    cur.execute(
-        """
-        INSERT INTO poller.codesystem_sync_state (system_url, version, resource_hash, resource_json, synced_at)
-        VALUES (%s, %s, %s, %s::jsonb, now())
-        ON CONFLICT (system_url) DO UPDATE SET
-            version = EXCLUDED.version,
-            resource_hash = EXCLUDED.resource_hash,
-            resource_json = EXCLUDED.resource_json,
-            synced_at = now()
-        """,
-        (system_url, version, resource_hash, json.dumps(resource_json)),
-    )
+    upsert_sync_state(cur, system_url, resource_hash, resource_json, endpoint_url)
 
     # 2a. Upsert all fresh concepts
     for concept in fresh_concepts.values():
@@ -220,6 +272,8 @@ def persist_state(
                 concept_hash = EXCLUDED.concept_hash,
                 properties = EXCLUDED.properties,
                 parent_code = EXCLUDED.parent_code,
+                active = true,
+                removed_at = NULL,
                 updated_at = now()
             """,
             (
@@ -233,10 +287,14 @@ def persist_state(
             ),
         )
 
-    # 2b. Delete removed concepts
+    # 2b. Soft-delete removed concepts (row kept as history, active = false)
     for concept in removed:
         cur.execute(
-            "DELETE FROM poller.codesystem_concept_state WHERE system_url = %s AND code = %s",
+            """
+            UPDATE poller.codesystem_concept_state
+            SET active = false, removed_at = now(), updated_at = now()
+            WHERE system_url = %s AND code = %s
+            """,
             (system_url, concept["code"]),
         )
 

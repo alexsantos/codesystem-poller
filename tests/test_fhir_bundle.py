@@ -140,8 +140,10 @@ class TestConceptParamsAdded:
     def test_resource_type(self):
         assert self.resource["resourceType"] == "Parameters"
 
-    def test_id_is_urn(self):
-        assert self.resource["id"].startswith("urn:uuid:")
+    def test_full_url_is_urn_and_id_is_valid_fhir_id(self):
+        assert self.resource_id.startswith("urn:uuid:")
+        assert self.resource["id"] == self.resource_id[len("urn:uuid:"):]
+        assert re.match(r"^[A-Za-z0-9\-\.]{1,64}$", self.resource["id"])
 
     def test_change_type(self):
         assert _param_value(self.params, "changeType") == "concept_added"
@@ -367,3 +369,19 @@ class TestBuildChangeBundle:
     def test_version_none_accepted(self):
         bundle = build_change_bundle(SYSTEM_URL, None, [ADDED_CONCEPT], [], [])
         assert bundle is not None
+
+
+class TestStableIds:
+    def test_bundle_id_used_for_bundle_and_header(self):
+        bid = "11111111-2222-3333-4444-555555555555"
+        bundle = build_change_bundle(SYSTEM_URL, VERSION, [ADDED_CONCEPT], [], [], bundle_id=bid)
+        header_entry = bundle["entry"][0]
+        assert bundle["id"] == bid
+        assert header_entry["resource"]["id"] == bid
+        assert header_entry["fullUrl"] == f"urn:uuid:{bid}"
+
+    def test_all_entry_ids_are_valid_fhir_ids(self):
+        bundle = build_change_bundle(SYSTEM_URL, VERSION, [ADDED_CONCEPT], [], [ADDED_CONCEPT])
+        for e in bundle["entry"]:
+            assert re.match(r"^[A-Za-z0-9\-\.]{1,64}$", e["resource"]["id"])
+            assert e["fullUrl"] == f"urn:uuid:{e['resource']['id']}"

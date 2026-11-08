@@ -27,6 +27,11 @@ def _uuid_urn() -> str:
     return f"urn:uuid:{uuid.uuid4()}"
 
 
+def _id_of(urn: str) -> str:
+    """Resource.id for an entry whose fullUrl is urn:uuid:<uuid> (FHIR ids cannot contain ':')."""
+    return urn.removeprefix("urn:uuid:")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -67,7 +72,7 @@ def _concept_params_added(system_url: str, version: str | None, concept: dict) -
         params.append(_param("parentCode", concept["parent_code"], "valueCode"))
     return resource_id, {
         "resourceType": "Parameters",
-        "id": resource_id,
+        "id": _id_of(resource_id),
         "parameter": [p for p in params if p is not None],
     }
 
@@ -83,7 +88,7 @@ def _concept_params_removed(system_url: str, version: str | None, concept: dict)
     ]
     return resource_id, {
         "resourceType": "Parameters",
-        "id": resource_id,
+        "id": _id_of(resource_id),
         "parameter": [p for p in params if p is not None],
     }
 
@@ -116,7 +121,7 @@ def _concept_params_modified(
         })
     return resource_id, {
         "resourceType": "Parameters",
-        "id": resource_id,
+        "id": _id_of(resource_id),
         "parameter": [p for p in params if p is not None],
     }
 
@@ -127,11 +132,12 @@ def _build_message_header(
     focus_references: list[str],
     system_url: str,
     timestamp: str,
+    header_uuid: str | None = None,
 ) -> tuple[str, dict]:
-    resource_id = _uuid_urn()
+    resource_id = f"urn:uuid:{header_uuid}" if header_uuid else _uuid_urn()
     return resource_id, {
         "resourceType": "MessageHeader",
-        "id": resource_id,
+        "id": _id_of(resource_id),
         "eventCoding": {
             "system": EVENT_SYSTEM,
             "code": EVENT_CODE,
@@ -155,6 +161,7 @@ def build_change_bundle(
     added: list[dict],
     modified: list[dict],
     removed: list[dict],
+    bundle_id: str | None = None,
 ) -> dict | None:
     """
     Build a FHIR R4 message Bundle for a batch of CodeSystem concept changes.
@@ -166,6 +173,10 @@ def build_change_bundle(
     added : Flattened concepts that are new
     modified : Dicts with code, old_concept, new_concept, changed_fields
     removed : Flattened concepts that were removed
+    bundle_id : UUID to use as Bundle.id and MessageHeader.id. Pass a stable
+        value so that redelivering the same Bundle can be deduplicated by the
+        receiver (FHIR messaging uses these ids for duplicate detection).
+        A random UUID is used when omitted.
 
     Returns None if there are no changes.
     """
@@ -188,7 +199,8 @@ def build_change_bundle(
         return None
 
     focus_refs = [entry_id for entry_id, _ in focus_entries]
-    header_id, header_resource = _build_message_header(focus_refs, system_url, timestamp)
+    bundle_id = bundle_id or str(uuid.uuid4())
+    header_id, header_resource = _build_message_header(focus_refs, system_url, timestamp, bundle_id)
 
     entries = [{"fullUrl": header_id, "resource": header_resource}]
     for entry_id, resource in focus_entries:
@@ -196,7 +208,7 @@ def build_change_bundle(
 
     return {
         "resourceType": "Bundle",
-        "id": str(uuid.uuid4()),
+        "id": bundle_id,
         "type": "message",
         "timestamp": timestamp,
         "meta": {"lastUpdated": timestamp},
